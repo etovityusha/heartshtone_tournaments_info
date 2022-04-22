@@ -1,0 +1,1 @@
+# heartshtone_tournaments_info
