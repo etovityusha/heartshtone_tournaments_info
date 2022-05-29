@@ -20,9 +20,9 @@ class TournamentDetail(BaseModel):
 
 
 class TournamentsETL(AbstractETL):
-    def __init__(self):
-        self.date_start = datetime.datetime.utcnow().date()
-        self.date_end = self.date_start + datetime.timedelta(weeks=8)
+    def __init__(self, date_start: datetime.date = None, date_end: datetime.date = None):
+        self.date_start = date_start if date_start else datetime.datetime.utcnow().date()
+        self.date_end = date_end if date_end else self.date_start + datetime.timedelta(weeks=8)
 
     async def _extract(self):
         url = f"https://majestic.battlefy.com/hearthstone-masters/tournaments?" \

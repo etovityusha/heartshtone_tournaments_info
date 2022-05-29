@@ -1,6 +1,5 @@
 import asyncio
-import datetime
-from typing import List
+from typing import List, Optional
 
 import httpx
 from pydantic import BaseModel
@@ -8,7 +7,7 @@ from pydantic import BaseModel
 from core.deck_strings import DeckStringCleaner
 from core.etl.abstract import AbstractETL
 from database import SessionLocal
-from models import Tournament
+from models import Tournament, TournamentPlayer, Player, TournamentPlayerDeck
 
 
 class TournamentInfoError(Exception):
@@ -17,7 +16,7 @@ class TournamentInfoError(Exception):
 
 class DeckModel(BaseModel):
     deck_string: str
-    deck_class: str
+    deck_class: Optional[str]
     archetype_prediction: str
 
 
@@ -53,10 +52,16 @@ class TournamentPlayersETL(AbstractETL):
                 tasks.append(asyncio.ensure_future(self._get_deck_strings(client, match_id=match['id'])))
             deck_strings = await asyncio.gather(*tasks)
             for match, ds in zip(matches, deck_strings):
-                if match['top']['battle_tag']:
-                    match['top']['decks'] = ds['top']
-                if match['bottom']['battle_tag']:
-                    match['bottom']['decks'] = ds['bottom']
+                try:
+                    if match['top']['battle_tag']:
+                        match['top']['decks'] = ds['top']
+                except KeyError:
+                    pass
+                try:
+                    if match['bottom']['battle_tag']:
+                        match['bottom']['decks'] = ds['bottom']
+                except KeyError:
+                    pass
             return matches
 
     async def _get_stages(self, client: httpx.AsyncClient):
@@ -77,12 +82,59 @@ class TournamentPlayersETL(AbstractETL):
         return resp.json()
 
     async def _transform(self, data):
-        pass
+        deck_strings, tasks, result = [], [], []
+        async with httpx.AsyncClient() as client:
+            for match in data:
+                for p in ('top', 'bottom'):
+                    if match[p]['battle_tag']:
+                        clean_deck_strings = [DeckStringCleaner.clean_deck_string(x) for x in match['top']['decks']]
+                        for cds in clean_deck_strings:
+                            deck_strings.append(cds)
+                            tasks.append(asyncio.ensure_future(self._get_archetype_predict(client, cds)))
+            predictions = await asyncio.gather(*tasks, return_exceptions=True)
+        deckstring_prediction = dict(zip(deck_strings, predictions))
+        for match in data:
+            for p in ('top', 'bottom'):
+                if match[p]['battle_tag']:
+                    clean_deck_strings = [DeckStringCleaner.clean_deck_string(x) for x in match['top']['decks']]
+                    result.append(
+                        TournamentPlayerModel
+                        (battle_tag=match[p]['battle_tag'],
+                         decks=[DeckModel(deck_string=x, archetype_prediction=str(deckstring_prediction[x]))
+                                for x in clean_deck_strings])
+                    )
+        return result
 
-    async def _get_archetype_predict(self, client: httpx.AsyncClient, deck_string: str):
-        pass
+    async def _get_archetype_predict(self, client: httpx.AsyncClient, deck_string: str) -> str:
+        response = await client.post('http://144.21.40.16:6200/predict', json={'deckstring': deck_string})
+        if response.status_code != 200:
+            raise Exception
+        return response.json()['prediction']
 
-    async def _load(self, data):
+    async def _load(self, data: List[TournamentPlayerModel]) -> List[TournamentPlayer]:
+        result = []
+        player_battle_tags = {x.battle_tag for x in data}
+
         with SessionLocal() as session:
-            pass
-        return data
+            players_in_db = session.query(Player).filter(Player.battletag.in_(player_battle_tags)).all()
+            players_in_db = {p.battletag: p.id for p in players_in_db}
+
+            tournament = session.query(Tournament).filter_by(battlefy_id=self.tournament_id).first()
+            for row in data:
+                if row.battle_tag in players_in_db:
+                    player_id = players_in_db[row.battle_tag]
+                else:
+                    player = Player(battletag=row.battle_tag, nickname=row.battle_tag[:row.battle_tag.index('#')])
+                    session.add(player)
+                    session.commit()
+                    players_in_db[row.battle_tag] = player.id
+                    player_id = player.id
+                tp = TournamentPlayer(player_id=player_id, tournament_id=tournament.id)
+                session.add(tp)
+                session.commit()
+                result.append(tp)
+                for deck in row.decks:
+                    session.add(TournamentPlayerDeck(tournament_player=tp, deck_string=deck.deck_string,
+                                                     archetype_predict=deck.archetype_prediction))
+                    session.commit()
+        return result
